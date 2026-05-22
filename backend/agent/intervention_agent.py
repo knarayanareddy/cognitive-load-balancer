@@ -50,19 +50,38 @@ class InterventionAgent:
         self.ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         self.ollama_model = os.getenv("OLLAMA_MODEL")
         self.ollama_available = False
+        self.ollama_models = []
         
         try:
             import requests
             resp = requests.get(f"{self.ollama_host}/api/tags", timeout=2.0)
             if resp.status_code == 200:
                 self.ollama_available = True
+                self.ollama_models = [m['name'] for m in resp.json().get('models', []) if 'embed' not in m['name']]
                 if not self.ollama_model:
-                    # Auto-detect first non-embedding model
-                    models = [m['name'] for m in resp.json().get('models', []) if 'embed' not in m['name']]
-                    if models:
-                        self.ollama_model = models[0]
-                    else:
-                        self.ollama_model = "llama3"
+                    # Prioritize gemma4:26b first, then qwen2.5:3b
+                    preferred_models = ["gemma4:26b", "qwen2.5:3b"]
+                    selected_model = None
+                    for pref in preferred_models:
+                        for m in self.ollama_models:
+                            if pref in m:
+                                selected_model = m
+                                break
+                        if selected_model:
+                            break
+                            
+                    if not selected_model:
+                        # Fallback to any other model containing gemma or qwen
+                        for m in self.ollama_models:
+                            if "gemma" in m.lower() or "qwen" in m.lower():
+                                selected_model = m
+                                break
+                                
+                    if not selected_model and self.ollama_models:
+                        # Fallback to first available non-embedding model
+                        selected_model = self.ollama_models[0]
+                        
+                    self.ollama_model = selected_model or "llama3"
         except Exception:
             self.ollama_available = False
             
@@ -177,63 +196,90 @@ class InterventionAgent:
 
         # If Claude didn't run or failed, check if Ollama is available
         if not selected and self.ollama_available:
-            print(f"🦙 Planning interventions using local Ollama (model: {self.ollama_model})...")
-            prompt = f"""
-            You are a Cognitive Load Balancer intervention planner.
-            Team member "{state['person_name']}" has a Cognitive Load Score of {state['cl_score']}/100.
-            
-            Risk factors:
-            {chr(10).join(state['risk_factors'])}
-            
-            Available interventions:
-            1. block_calendar_time - Add focus blocks to calendar (params: duration_minutes)
-            2. set_slack_status - Signal focus mode to team (params: status_text, status_emoji, duration_minutes)
-            3. send_slack_dm - Personal check-in message (params: message)
-            4. notify_manager - Private manager alert (params: manager_id, alert_message)
-            5. reduce_sprint_scope - PM notification (params: pm_id, message)
-            6. enable_auto_dnd - After-hours protection (params: start_hour, end_hour)
-            
-            Select the 2-3 most appropriate interventions for this specific situation.
-            Consider: severity, risk factors, least invasive first.
-            
-            You must return a valid JSON array of objects, where each object has the keys: "tool", "params", and "reason".
-            Do not include any extra text outside the JSON array.
-            """
-            try:
-                import requests
-                payload = {
-                    'model': self.ollama_model,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                    'stream': False,
-                    'options': {
-                        'temperature': 0.3
-                    },
-                    'format': 'json'
-                }
-                r = requests.post(f"{self.ollama_host}/api/chat", json=payload, timeout=15.0)
-                if r.status_code == 200:
-                    content = r.json()['message']['content'].strip()
-                    data = json.loads(content)
-                    if isinstance(data, list):
-                        selected = data
-                    elif isinstance(data, dict):
-                        if "interventions" in data and isinstance(data["interventions"], list):
-                            selected = data["interventions"]
-                        elif "selected_interventions" in data and isinstance(data["selected_interventions"], list):
-                            selected = data["selected_interventions"]
-                        elif "tools" in data and isinstance(data["tools"], list):
-                            selected = data["tools"]
-                        else:
-                            if "tool" in data:
-                                selected = [data]
+            models_to_try = []
+            if os.getenv("OLLAMA_MODEL"):
+                models_to_try = [os.getenv("OLLAMA_MODEL")]
+            else:
+                # Find matching models from available ones
+                gemma_model = next((m for m in self.ollama_models if "gemma4:26b" in m), None)
+                qwen_model = next((m for m in self.ollama_models if "qwen2.5:3b" in m), None)
+                
+                if gemma_model:
+                    models_to_try.append(gemma_model)
+                if qwen_model:
+                    models_to_try.append(qwen_model)
+                    
+                # Append other models
+                for m in self.ollama_models:
+                    if m not in models_to_try:
+                        models_to_try.append(m)
+                        
+                if not models_to_try:
+                    models_to_try = ["llama3"]
+
+            for model_name in models_to_try:
+                # Set dynamic timeouts (35s for 26B, 15s for 3B/others)
+                timeout_sec = 35.0 if "26b" in model_name else 15.0
+                print(f"🦙 Attempting planning with local Ollama (model: {model_name}, timeout: {timeout_sec}s)...")
+                
+                prompt = f"""
+                You are a Cognitive Load Balancer intervention planner.
+                Team member "{state['person_name']}" has a Cognitive Load Score of {state['cl_score']}/100.
+                
+                Risk factors:
+                {chr(10).join(state['risk_factors'])}
+                
+                Available interventions:
+                1. block_calendar_time - Add focus blocks to calendar (params: duration_minutes)
+                2. set_slack_status - Signal focus mode to team (params: status_text, status_emoji, duration_minutes)
+                3. send_slack_dm - Personal check-in message (params: message)
+                4. notify_manager - Private manager alert (params: manager_id, alert_message)
+                5. reduce_sprint_scope - PM notification (params: pm_id, message)
+                6. enable_auto_dnd - After-hours protection (params: start_hour, end_hour)
+                
+                Select the 2-3 most appropriate interventions for this specific situation.
+                Consider: severity, risk factors, least invasive first.
+                
+                You must return a valid JSON array of objects, where each object has the keys: "tool", "params", and "reason".
+                Do not include any extra text outside the JSON array.
+                """
+                try:
+                    import requests
+                    payload = {
+                        'model': model_name,
+                        'messages': [{'role': 'user', 'content': prompt}],
+                        'stream': False,
+                        'options': {
+                            'temperature': 0.3
+                        },
+                        'format': 'json'
+                    }
+                    r = requests.post(f"{self.ollama_host}/api/chat", json=payload, timeout=timeout_sec)
+                    if r.status_code == 200:
+                        content = r.json()['message']['content'].strip()
+                        data = json.loads(content)
+                        if isinstance(data, list):
+                            selected = data
+                        elif isinstance(data, dict):
+                            if "interventions" in data and isinstance(data["interventions"], list):
+                                selected = data["interventions"]
+                            elif "selected_interventions" in data and isinstance(data["selected_interventions"], list):
+                                selected = data["selected_interventions"]
+                            elif "tools" in data and isinstance(data["tools"], list):
+                                selected = data["tools"]
                             else:
-                                for val in data.values():
-                                    if isinstance(val, list):
-                                        selected = val
-                                        break
-            except Exception as e:
-                print(f"⚠️ Ollama planning failed: {e}")
-                selected = []
+                                if "tool" in data:
+                                    selected = [data]
+                                else:
+                                    for val in data.values():
+                                        if isinstance(val, list):
+                                            selected = val
+                                            break
+                        if selected:
+                            print(f"✅ Successfully planned using model: {model_name}")
+                            break
+                except Exception as e:
+                    print(f"⚠️ Ollama model {model_name} failed or timed out: {e}")
 
         # Fallback Planner: Rule-based structured planner to ensure offline runtime safety
         if not selected:
